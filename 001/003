@@ -1,1 +1,146 @@
-1111
+#!/usr/bin/env python
+import os,sys,json
+import boto3
+import tarfile
+import shutil 
+
+def dump_work_load(conf):
+    ##################################################################################
+    #Get Config file                                                                 #
+    ##################################################################################
+    print("this_env_conf is :",conf["this_env_conf"])
+    conf["this_env_bucket_name_silver2"] = conf["this_env_conf"]["bucket_name_silver2"]
+    conf["this_env_bucket_name_gold"] = conf["this_env_conf"]["bucket_name_gold"]
+    conf["this_env_bucket_name_asset2"] = conf["this_env_conf"]["bucket_name_asset2"]
+    conf["this_env_catalog_db_silver2"] = conf["this_env_conf"]["catalog_db_silver2"]
+    conf["this_env_catalog_db_gold"] = conf["this_env_conf"]["catalog_db_gold"]
+    conf["this_env_catalog_db_central_silver2_link"] = conf["this_env_conf"]["catalog_db_central_silver2_link"]
+    path_arr = conf['conf_dir'].split('/')
+
+    bucket_name = path_arr.pop(2)
+    conf_path = ""
+    for this_dir in path_arr[2:]:
+        if this_dir != "":
+            conf_path = conf_path + this_dir + "/"
+    conf_path_list = conf_path + "list_file/"
+    s3_client = boto3.client('s3')
+    print("the conf_path_list is :"+conf_path_list)
+    response = s3_client.list_objects(Bucket=bucket_name,MaxKeys=100,Prefix=conf_path_list)
+    #print(f"the response is : {response}")
+    tmp_dir = "/tmp/tmp_download_dir/"
+    if not os.path.exists(tmp_dir):
+        os.makedirs(tmp_dir)
+        print("localpath:",tmp_dir)
+    for the_file in response['Contents']:
+        #print("the_file key is :",the_file['Key'])
+        #print(f"the_file is : {the_file}")
+        file_name = the_file['Key'].split('/').pop(-1)
+        if file_name:
+            print(file_name)
+            s3_client.download_file(bucket_name,the_file['Key'],tmp_dir+file_name)  
+    
+
+
+    ##################################################################################
+    #Generate tf file                                                                #
+    ##################################################################################
+    os.makedirs("/tmp/output/", exist_ok=True)
+    #Generate workflow_file    
+    from .export_workflow import main as export_workflow
+    print("export workflow")
+    output_fd = open("/tmp/output/glue-workflow.tf","w")
+    output_fd.write(export_workflow(conf))
+    output_fd.close()
+    
+    #Generate classifier_file
+    # from .export_classifier import main as export_classifier
+    # print("export classifier")
+    # output_fd = open("/tmp/output/glue-classifier.tf","w")
+    # output_fd.write(export_classifier(conf))
+    # output_fd.close()
+    
+    #Generate crawler_file
+    from .export_crawler import main as export_crawler
+    print("export crawler")
+    output_fd = open("/tmp/output/glue-crawler.tf","w")
+    output_fd.write(export_crawler(conf))
+    output_fd.close()
+    
+    #Generate trigger_file
+    from .export_trigger import main as export_trigger
+    print("export trigger")
+    output_fd = open("/tmp/output/glue-trigger.tf","w")
+    output_fd.write(export_trigger(conf))
+    output_fd.close()
+    
+    #Generate Glue_file
+    from .export_glue import main as export_glue
+    print("export glue")
+    output_fd = open("/tmp/output/glue-job.tf","w")
+    output_fd.write(export_glue(conf))
+    output_fd.close()
+    
+    #Generate wmaa_dag_file
+    #from .export_s3_file import main as export_s3_file
+    #print("export s3 file")
+    #dag_return = export_s3_file(conf)
+    #print(f"the dag_return is : {dag_return}")
+
+    #Replace Value
+    key_list = ['bucket_name_silver2','bucket_name_gold','bucket_name_asset2','catalog_db_silver2','catalog_db_gold','catalog_db_central_silver2_link']
+    for line in open("/tmp/tmp_download_dir/conf_list","r"):
+        this_file = "/tmp/"+line.strip()
+        r_file = open(this_file, "r")
+        r_text = r_file.read(-1)
+        r_file.close()
+        qa_file = open('/tmp/output/qa.conf','w')
+        prod_file = open('/tmp/output/prod.conf','w')
+
+        if conf["my_env"] == "dev":
+            qa_text = r_text
+            for the_key in key_list:
+                qa_text = qa_text.replace(conf['dev'][the_key],conf['qa'][the_key])
+            qa_file.write(qa_text)
+            qa_file.close()
+
+            prod_text = r_text
+            for the_key in key_list:
+                prod_text = prod_text.replace(conf['dev'][the_key],conf['prod'][the_key])
+            prod_file.write(prod_text)
+            prod_file.close()
+        elif conf["my_env"] == "qa":
+            prod_text = r_text
+            for the_key in key_list:
+                prod_text = prod_text.replace(conf['qa'][the_key],conf['prod'][the_key])
+            prod_file.write(prod_text)
+            prod_file.close()
+
+    if os.path.exists('/tmp/output/asset/'):
+        shutil.rmtree('/tmp/output/asset/')
+    os.rename("/tmp/asset/","/tmp/output/asset/")
+    
+    #if os.path.exists('/tmp/output/asset_mwaa/'):
+    #   shutil.rmtree('/tmp/output/asset_mwaa/')
+    #os.rename("/tmp/asset_mwaa/","/tmp/output/asset_mwaa/")
+
+        
+    ##################################################################################
+    #Upload tf file to s3                                                            #
+    ##################################################################################
+    #os.popen('tar -czvf /tmp/all.tar.gz /tmp/output/')
+    tar_file = tarfile.open("/tmp/all.tar.gz", "w:gz")
+    tar_file.add("/tmp/output/")
+    tar_file.close()
+    s3_client = boto3.client('s3')
+    s3_client.upload_file("/tmp/all.tar.gz",bucket_name,conf_path+"all.tar.gz")
+    for root, dirs, files in os.walk("/tmp/output"):
+        for name in files:
+            the_file = os.path.join(root, name)
+            #print(the_file)
+            #file_name = the_file.split('/').pop(-1)
+            file_name = the_file
+            file_name.lstrip("/tmp/output/")
+            #print(file_name)
+            #print(the_file)
+            s3_client.upload_file(the_file,bucket_name,conf_path+"tf_conf/"+file_name)
+
